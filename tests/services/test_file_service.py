@@ -349,3 +349,31 @@ def test_paths_share_storage_target_missing_path(tmp_path: Path):
     (tmp_path / "present.md").write_text("x")
 
     assert service.paths_share_storage_target("present.md", "absent.md") is False
+
+
+@pytest.mark.asyncio
+async def test_directory_has_files_reads_storage_not_the_index(file_service: FileService):
+    """A folder counts once storage holds a file in it, at any depth, indexed or not;
+    an empty or missing folder does not, the same answer object storage gives (#1775)."""
+    base = file_service.base_path
+    (base / "logs" / "2026").mkdir(parents=True)
+    (base / "logs" / "2026" / "today.md").write_text("# Today", encoding="utf-8")
+    (base / "empty").mkdir()
+
+    assert await file_service.directory_has_files("logs") is True
+    assert await file_service.directory_has_files("logs/2026") is True
+    assert await file_service.directory_has_files("empty") is False
+    assert await file_service.directory_has_files("missing") is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["../outside", "notes/../../outside", "/tmp"])
+async def test_directory_has_files_refuses_paths_outside_the_project(
+    file_service: FileService, path: str
+):
+    """The folder check never walks a directory outside the project (#1782 review)."""
+    (file_service.base_path.parent / "outside").mkdir(exist_ok=True)
+    (file_service.base_path.parent / "outside" / "secret.md").write_text("x", encoding="utf-8")
+
+    with pytest.raises(FileOperationError, match="outside the project"):
+        await file_service.directory_has_files(path)

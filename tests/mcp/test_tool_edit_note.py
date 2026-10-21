@@ -389,6 +389,46 @@ async def test_edit_note_append_creates_json_format(client, test_project):
 
 
 @pytest.mark.asyncio
+async def test_edit_note_append_strips_project_prefix_on_autocreate(client, test_project):
+    """Project-prefixed identifiers must not create a nested project directory."""
+    identifier = f"{test_project.permalink}/scratch/repro/note-c"
+    result = await edit_note(
+        project=test_project.name,
+        identifier=identifier,
+        operation="append",
+        content="Disposable reproduction note.",
+        output_format="json",
+    )
+
+    assert isinstance(result, dict)
+    assert result["fileCreated"] is True
+    assert result["file_path"] == "scratch/repro/note-c.md"
+    assert (Path(test_project.path) / "scratch" / "repro" / "note-c.md").exists()
+    assert not (Path(test_project.path) / test_project.permalink / "scratch").exists()
+
+
+@pytest.mark.asyncio
+async def test_edit_note_append_strips_project_prefix_memory_url_on_autocreate(
+    client, test_project
+):
+    """memory:// URLs that include the active project create at the relative path."""
+    identifier = f"memory://{test_project.permalink}/scratch/repro/note-mem"
+    result = await edit_note(
+        project=test_project.name,
+        identifier=identifier,
+        operation="append",
+        content="Disposable memory-url reproduction note.",
+        output_format="json",
+    )
+
+    assert isinstance(result, dict)
+    assert result["fileCreated"] is True
+    assert result["file_path"] == "scratch/repro/note-mem.md"
+    assert (Path(test_project.path) / "scratch" / "repro" / "note-mem.md").exists()
+    assert not (Path(test_project.path) / test_project.permalink / "scratch").exists()
+
+
+@pytest.mark.asyncio
 async def test_edit_note_memory_url_unresolved_project_never_autocreates(client, test_project):
     """A failed memory URL route must not create a phantom note in the active project."""
     # A failed edit is a tool error (isError), and its message keeps the guidance.
@@ -1586,6 +1626,138 @@ async def test_edit_note_append_recovers_file_on_disk_instead_of_autocreate(clie
 
 
 @pytest.mark.asyncio
+async def test_edit_note_append_recovers_unindexed_file_below_the_project_prefix(
+    client, test_project
+):
+    """Codex P1 on #1776: disk recovery probed only the prefixed path, missed the real
+    file, and the create that followed collided with it. Every reading is probed now,
+    so the note on disk is edited (#1775)."""
+    note_path = Path(test_project.path) / "notes" / "prefixed-disk.md"
+    note_path.parent.mkdir(parents=True, exist_ok=True)
+    note_path.write_text("# Prefixed Disk\n\nOriginal disk content.\n", encoding="utf-8")
+
+    result = await edit_note(
+        project=test_project.name,
+        identifier=f"{test_project.permalink}/notes/prefixed-disk",
+        operation="append",
+        content="\nAppended line.",
+        output_format="json",
+    )
+
+    assert isinstance(result, dict)
+    assert result["fileCreated"] is False
+    assert result["file_path"] == "notes/prefixed-disk.md"
+    assert "Appended line." in note_path.read_text(encoding="utf-8")
+    assert not (Path(test_project.path) / test_project.permalink).exists()
+
+
+@pytest.mark.asyncio
+async def test_edit_note_append_creates_inside_an_existing_folder_named_like_the_project(
+    client, test_project
+):
+    """A real folder named like the project is evidence the caller meant it, even though
+    permalinks carry the project prefix and would otherwise strip it (#1775)."""
+    await write_note(
+        project=test_project.name,
+        title="Anchor",
+        directory=f"{test_project.permalink}/logs",
+        content="# Anchor",
+    )
+
+    result = await edit_note(
+        project=test_project.name,
+        identifier=f"{test_project.permalink}/logs/today",
+        operation="append",
+        content="First entry.",
+        output_format="json",
+    )
+
+    assert isinstance(result, dict)
+    assert result["fileCreated"] is True
+    assert result["file_path"] == f"{test_project.permalink}/logs/today.md"
+
+
+@pytest.mark.asyncio
+async def test_edit_note_append_reads_folders_from_storage_not_the_index(client, test_project):
+    """Codex review on #1782: a folder whose notes exist only on disk, not yet indexed,
+    still holds files. Judging folders from the index would read it as empty, create
+    below the prefix instead, and leave a note no later reindex relocates (#1775)."""
+    on_disk = Path(test_project.path) / test_project.permalink / "logs" / "yesterday.md"
+    on_disk.parent.mkdir(parents=True)
+    on_disk.write_text("# Yesterday", encoding="utf-8")
+
+    result = await edit_note(
+        project=test_project.name,
+        identifier=f"{test_project.permalink}/logs/today",
+        operation="append",
+        content="First entry.",
+        output_format="json",
+    )
+
+    assert isinstance(result, dict)
+    assert result["fileCreated"] is True
+    assert result["file_path"] == f"{test_project.permalink}/logs/today.md"
+    assert not (Path(test_project.path) / "logs").exists()
+
+
+@pytest.mark.asyncio
+async def test_edit_note_append_counts_an_accepted_note_not_yet_on_storage(client, test_project):
+    """Codex review on #1782: production accepts a write before materializing its file,
+    so a folder holding only an accepted note is not on storage yet. It still decides
+    placement, or the next note in it lands below the prefix for good (#1775)."""
+    anchor = await write_note(
+        project=test_project.name,
+        title="Anchor",
+        directory=f"{test_project.permalink}/logs",
+        content="# Anchor",
+        output_format="json",
+    )
+    assert isinstance(anchor, dict)
+    # Stand in for a materialization that has not run yet: the accepted note keeps its
+    # entity row, and storage holds no file in the folder.
+    (Path(test_project.path) / anchor["file_path"]).unlink()
+
+    result = await edit_note(
+        project=test_project.name,
+        identifier=f"{test_project.permalink}/logs/today",
+        operation="append",
+        content="First entry.",
+        output_format="json",
+    )
+
+    assert isinstance(result, dict)
+    assert result["file_path"] == f"{test_project.permalink}/logs/today.md"
+
+
+@pytest.mark.asyncio
+async def test_edit_note_append_refuses_when_both_folders_hold_notes(client, test_project):
+    """When the folder below the prefix and a folder named like the project both exist,
+    nothing says which one the caller meant, so append refuses instead of guessing and
+    names the spelling that picks each (#1775)."""
+    for directory in ("logs", f"{test_project.permalink}/logs"):
+        await write_note(
+            project=test_project.name,
+            title="Anchor",
+            directory=directory,
+            content="# Anchor",
+        )
+
+    with pytest.raises(ToolError) as excinfo:
+        await edit_note(
+            project=test_project.name,
+            identifier=f"{test_project.permalink}/logs/today",
+            operation="append",
+            content="First entry.",
+            output_format="json",
+        )
+
+    refusal = json.loads(str(excinfo.value))
+    assert refusal["error"] == "AMBIGUOUS_NOTE_PATH"
+    assert refusal["candidates"] == ["logs/today.md", f"{test_project.permalink}/logs/today.md"]
+    assert not (Path(test_project.path) / "logs" / "today.md").exists()
+
+
+@pytest.mark.asyncio
 async def test_edit_note_append_recovers_markdown_suffix_file_from_stem(client, test_project):
     """A stem identifier for an on-disk .markdown file edits it, not auto-creates .md (#581).
 
@@ -1735,6 +1907,37 @@ async def test_edit_note_append_traversal_identifier_json_error(client, test_pro
     result = json.loads(str(refusal.value))
     assert result["error"] == "SECURITY_VALIDATION_ERROR"
     assert result["fileCreated"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "identifier_below_prefix",
+    ["../../outside-project/secrets/note", "/tmp/outside-note", "notes/../../../escape"],
+)
+async def test_edit_note_append_refuses_prefixed_paths_that_escape_the_project(
+    client, test_project, identifier_below_prefix
+):
+    """A project prefix in front of a traversal must not reach storage: placement
+    refuses before probing a folder, and nothing is recovered or created outside the
+    project (#1782 review)."""
+    outside = Path(test_project.path).parent / "outside-project" / "secrets"
+    outside.mkdir(parents=True, exist_ok=True)
+    (outside / "existing.md").write_text("# Existing", encoding="utf-8")
+
+    with pytest.raises(ToolError) as refusal:
+        await edit_note(
+            project=test_project.name,
+            identifier=f"{test_project.permalink}/{identifier_below_prefix}",
+            operation="append",
+            content="should never be written",
+            output_format="json",
+        )
+
+    result = json.loads(str(refusal.value))
+    assert result["error"] == "SECURITY_VALIDATION_ERROR"
+    assert result["fileCreated"] is False
+    assert sorted(path.name for path in outside.iterdir()) == ["existing.md"]
+    assert not Path("/tmp/outside-note.md").exists()
 
 
 @pytest.mark.asyncio

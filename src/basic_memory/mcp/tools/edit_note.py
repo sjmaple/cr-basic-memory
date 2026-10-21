@@ -35,11 +35,19 @@ from basic_memory.mcp.server import mcp
 from basic_memory.mcp.tools.utils import _extract_response_data, _response_detail_text
 from basic_memory.schemas.base import Entity
 from basic_memory.schemas.v2.entity import EntityResolveResponse, EntityResponseV2
+from basic_memory.schemas.v2.note_placement import (
+    AmbiguousNotePlacementResponse,
+    NoteCreatePlacementResponse,
+    OutsideProjectPlacementResponse,
+)
 from basic_memory.services.link_resolver import (
     detect_project_from_workspace_identifier_prefix,
     is_workspace_qualified_plain_identifier,
 )
-from basic_memory.utils import coerce_dict, normalize_project_reference, validate_project_path
+from basic_memory.utils import (
+    coerce_dict,
+    normalize_project_reference,
+)
 
 EDIT_OPERATIONS = (
     "append",
@@ -51,31 +59,18 @@ EDIT_OPERATIONS = (
 )
 
 
-def _parse_identifier_to_title_and_directory(identifier: str) -> tuple[str, str]:
-    """Parse an identifier into (title, directory) for creating a new note.
-
-    Strips memory:// prefix if present, then splits on the last '/' to
-    separate the directory path from the note title.
-
-    Examples:
-        "conversations/my-note" → ("my-note", "conversations")
-        "my-note"              → ("my-note", "")
-        "a/b/c/my-note"       → ("my-note", "a/b/c")
-        "memory://a/b/note"   → ("note", "a/b")
-    """
-    cleaned = identifier
-    if cleaned.startswith("memory://"):
-        cleaned = cleaned[len("memory://") :]
-
-    if "/" in cleaned:
-        last_slash = cleaned.rfind("/")
-        directory = cleaned[:last_slash]
-        title = cleaned[last_slash + 1 :]
-    else:
-        directory = ""
-        title = cleaned
-
-    return title, directory
+def _format_ambiguous_note_path_response(
+    placement: AmbiguousNotePlacementResponse, project_permalink: str
+) -> str:
+    """Name both notes the path could create and the spelling that picks each."""
+    return (
+        f"# Edit Failed - Ambiguous Note Path\n\n"
+        f"'{placement.literal}' does not exist yet, and project '{project_permalink}' "
+        "has both folders it could name, so append/prepend will not guess where to "
+        "create it.\n\n"
+        f"- `{placement.below_prefix}` creates `{placement.below_prefix}.md`\n"
+        f"- `{project_permalink}/{placement.literal}` creates `{placement.literal}.md`\n"
+    )
 
 
 # Suffixes mimetypes maps to text/markdown (extension matching is case-insensitive),
@@ -833,10 +828,46 @@ async def edit_note(
                     #   would resurrect the note with the caller's own checksum,
                     #   which the precondition would then accept.
                     recovered_entity_id: str | None = None
+                    placement: (
+                        NoteCreatePlacementResponse
+                        | AmbiguousNotePlacementResponse
+                        | OutsideProjectPlacementResponse
+                        | None
+                    ) = None
                     if is_not_found and expected_checksum is None:
-                        recovered_entity_id = await _resolve_after_disk_recovery(
-                            knowledge_client, entity_identifier
-                        )
+                        # The server reads the identifier the way resolution did and
+                        # judges folders from storage. Every reading is probed, so an
+                        # unindexed file below the project prefix is found before a
+                        # create could collide with it (#1775).
+                        placement = await knowledge_client.place_note(identifier)
+                        if isinstance(placement, OutsideProjectPlacementResponse):
+                            # The server refused before probing any folder; nothing
+                            # outside the project is recovered or created.
+                            logger.warning(
+                                "Attempted path traversal attack blocked",
+                                path=placement.path,
+                                project=active_project.name,
+                            )
+                            _raise_edit_failure(
+                                output_format,
+                                {
+                                    "title": None,
+                                    "permalink": None,
+                                    "file_path": None,
+                                    "checksum": None,
+                                    "operation": operation,
+                                    "fileCreated": False,
+                                    "error": "SECURITY_VALIDATION_ERROR",
+                                },
+                                f"# Error\n\nNote path '{placement.path}' is not allowed - "
+                                "paths must stay within project boundaries",
+                            )
+                        for reading in placement.readings:
+                            recovered_entity_id = await _resolve_after_disk_recovery(
+                                knowledge_client, reading
+                            )
+                            if recovered_entity_id is not None:
+                                break
 
                     if recovered_entity_id is not None:
                         entity_id = recovered_entity_id
@@ -865,36 +896,34 @@ async def edit_note(
                                 identifier, None, active_project.external_id
                             ),
                         )
-                    elif is_not_found and operation in ("append", "prepend"):
+                    elif placement is not None and operation in ("append", "prepend"):
                         # Trigger: entity does not exist yet (on disk or in the index)
                         # Why: append/prepend can meaningfully create a new note from the
                         #      content, while find_replace/replace_section require existing
                         #      content to modify
-                        # Outcome: note is created via the same path as write_note
-                        title, directory = _parse_identifier_to_title_and_directory(identifier)
-
-                        # Validate directory path (same security check as write_note)
-                        project_path = active_project.home
-                        if directory and not validate_project_path(directory, project_path):
-                            logger.warning(
-                                "Attempted path traversal attack blocked",
-                                directory=directory,
-                                project=active_project.name,
-                            )
+                        # Outcome: note is created via the same path as write_note, where
+                        #      the server placed it, or refused when the path is ambiguous
+                        if isinstance(placement, AmbiguousNotePlacementResponse):
                             _raise_edit_failure(
                                 output_format,
                                 {
-                                    "title": title,
+                                    "title": None,
                                     "permalink": None,
                                     "file_path": None,
                                     "checksum": None,
                                     "operation": operation,
                                     "fileCreated": False,
-                                    "error": "SECURITY_VALIDATION_ERROR",
+                                    "error": "AMBIGUOUS_NOTE_PATH",
+                                    "candidates": [
+                                        f"{placement.below_prefix}.md",
+                                        f"{placement.literal}.md",
+                                    ],
                                 },
-                                f"# Error\n\nDirectory path '{directory}' is not allowed - "
-                                "paths must stay within project boundaries",
+                                _format_ambiguous_note_path_response(
+                                    placement, active_project.permalink
+                                ),
                             )
+                        directory, title = placement.directory, placement.title
 
                         entity = Entity(
                             title=title,

@@ -24,7 +24,7 @@ from basic_memory.models import Entity as EntityModel
 from basic_memory.runtime.storage import RUNTIME_MARKDOWN_CONTENT_TYPE
 from basic_memory.schemas import Entity as EntitySchema
 from basic_memory.services.exceptions import FileOperationError
-from basic_memory.utils import FilePath
+from basic_memory.utils import FilePath, validate_project_path
 from loguru import logger
 
 
@@ -48,6 +48,11 @@ class StoredFile:
 
     content: bytes
     checksum: str
+
+
+def _directory_holds_a_file(directory: Path) -> bool:
+    """Return whether a directory holds a file at any depth, stopping at the first."""
+    return directory.is_dir() and any(entry.is_file() for entry in directory.rglob("*"))
 
 
 class FileService:
@@ -149,6 +154,25 @@ class FileService:
         except Exception as e:
             logger.error("Failed to check file existence", path=str(path), error=str(e))
             raise FileOperationError(f"Failed to check file existence: {e}")
+
+    async def directory_has_files(self, path: FilePath) -> bool:
+        """Return whether a project directory holds at least one file, at any depth.
+
+        Storage is the canonical record of which folders exist; the index can lag
+        files written directly to disk. A directory with no files reads as absent,
+        which is also the only answer object storage can give, where folders exist
+        only as key prefixes.
+
+        Raises:
+            FileOperationError: the path resolves outside the project. Callers check
+                the boundary first; this keeps the walk from ever becoming a probe of
+                other directories on the server.
+        """
+        if not validate_project_path(str(path), self.base_path):
+            raise FileOperationError(f"Directory '{path}' is outside the project")
+        # The walk stops at the first file, but a deep tree of empty folders still
+        # costs a scan, so it runs off the event loop.
+        return await asyncio.to_thread(_directory_holds_a_file, self.base_path / path)
 
     def paths_share_storage_target(self, left: FilePath, right: FilePath) -> bool:
         """Return whether two project paths resolve to the same physical file.
